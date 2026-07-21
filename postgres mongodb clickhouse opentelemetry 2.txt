@@ -1,0 +1,278 @@
+we have to perform this task. also tell me what we have to do step by step from scratch and what exactly this task do?
+
+Plan for Pushing Application-Specific Logs/Metrics/Traces to ClickHouse via OpenTelemetry
+
+Consider only metrics/traces to start with as phase 1
+Objective:
+Integrate OpenTelemetry to push logs, metrics, and traces from 35+ applications (e.g., PostgreSQL, MongoDB, RedisDB, KeyDB, Kafka, etc.) into ClickHouse. Start with PostgreSQL and MongoDB as the initial applications for implementation.
+
+Set Up OpenTelemetry for PostgreSQL (MongoDB too)
+Install OpenTelemetry Collector:
+Deploy the OpenTelemetry Collector in your environment (VMWare Ubuntu).
+Configure the collector to receive PostgreSQL logs, metrics, and traces.
+Enable PostgreSQL Monitoring:
+Install the PostgreSQL OpenTelemetry instrumentation library.
+Configure PostgreSQL to emit logs and metrics in a format compatible with OpenTelemetry.
+Define Collector Pipeline:
+Create a pipeline in the OpenTelemetry Collector to process PostgreSQL data.
+Use the otlp receiver and clickhouse exporter to send data to ClickHouse.
+Use default schema of OpenTelemetry to store logs, metrics, and traces.
+Test and Validate:
+Generate sample PostgreSQL events (e.g., queries, errors).
+Verify the data is correctly ingested into ClickHouse.
+Iterate and Expand
+Document the Process:
+Record the steps and configurations for PostgreSQL and MongoDB.
+Create reusable templates for other applications.
+Add More Applications:
+Gradually onboard other applications (e.g., RedisDB, Kafka) using the same approach.
+
+Let's get started. We will execute this in a logical order: **Destination (ClickHouse) -> Source (DBs) -> The Agent (OTel Collector).**
+
+We are assuming you have **Ubuntu** ready and root/sudo access.
+
+---
+
+### Step 1: Prepare ClickHouse (The Destination)
+
+We must create the tables in ClickHouse where the data will live. If we don't do this, the Collector will try to write data and fail because there is nowhere to put it.
+
+**Action:** Log into your ClickHouse server (via CLI or your UI tool) and run the following SQL script. This creates a database named `otel` and the specific tables required by the OpenTelemetry ClickHouse Exporter.
+
+**Run this SQL in ClickHouse:**
+
+```sql
+-- 1. Create the database
+CREATE DATABASE IF NOT EXISTS otel;
+
+-- 2. Create the Metrics table
+-- This stores CPU, RAM, Connection counts, etc.
+CREATE TABLE IF NOT EXISTS otel.otlp_metrics (
+    ResourceAttributes Map(LowCardinality(String), String),
+    ResourceSchemaUrl String,
+    ScopeName String,
+    ScopeVersion String,
+    ScopeAttributes Map(LowCardinality(String), String),
+    ScopeSchemaUrl String,
+    ServiceName LowCardinality(String),
+    MetricName String,
+    MetricDescription String,
+    MetricUnit String,
+    Attributes Map(LowCardinality(String), String),
+    StartTimeUnix Nano,
+    TimeUnix Nano,
+    Value Float64,
+    Flags UInt32
+) ENGINE = MergeTree
+PARTITION BY toDate(TimeUnix / 1000000000)
+ORDER BY (ServiceName, MetricName, Attributes, toUnixTimestamp(TimeUnix / 1000000000))
+TTL toDateTime(TimeUnix / 1000000000) + INTERVAL 30 DAY;
+
+-- 3. Create the Traces table
+-- This stores query execution paths and latencies.
+CREATE TABLE IF NOT EXISTS otel.otlp_traces (
+    Timestamp Nano,
+    TraceId String,
+    SpanId String,
+    ParentSpanId String,
+    TraceState String,
+    SpanName LowCardinality(String),
+    SpanKind LowCardinality(String),
+    ServiceName LowCardinality(String),
+    ResourceAttributes Map(LowCardinality(String), String),
+    ScopeName String,
+    ScopeVersion String,
+    SpanAttributes Map(LowCardinality(String), String),
+    Duration Nano,
+    StatusCode LowCardinality(String),
+    StatusMessage String,
+    Events Nested (
+        Timestamp Nano,
+        Name LowCardinality(String),
+        Attributes Map(LowCardinality(String), String)
+    ),
+    Links Nested (
+        TraceId String,
+        SpanId String,
+        TraceState String,
+        Attributes Map(LowCardinality(String), String)
+    )
+) ENGINE = MergeTree
+PARTITION BY toDate(Timestamp / 1000000000)
+ORDER BY (ServiceName, SpanName, toUnixTimestamp(Timestamp / 1000000000), TraceId)
+TTL toDateTime(Timestamp / 1000000000) + INTERVAL 7 DAY;
+```
+
+---
+
+### Step 2: Prepare the Applications (The Sources)
+
+The OpenTelemetry Collector needs a valid username/password to ask your databases for their statistics.
+
+#### A. Setup PostgreSQL User
+1. Access your PostgreSQL database (e.g., `sudo -u postgres psql`).
+2. Run these commands to create a monitoring user:
+
+```sql
+-- Create a user specifically for monitoring
+CREATE USER otel_monitor WITH PASSWORD 'your_secure_password';
+
+-- Grant permission to read statistics
+GRANT pg_monitor TO otel_monitor; 
+-- Note: If on an older Postgres version (<10), use: GRANT SELECT ON pg_stat_database TO otel_monitor;
+```
+
+#### B. Setup MongoDB User
+1. Access your MongoDB shell (`mongosh`).
+2. Switch to the admin database and create a user with the `clusterMonitor` role:
+
+```javascript
+use admin
+db.createUser({
+  user: "otel_monitor",
+  pwd: "your_secure_password",
+  roles: [
+    { role: "clusterMonitor", db: "admin" },
+    { role: "read", db: "local" }
+  ]
+})
+```
+
+---
+
+### Step 3: Install OpenTelemetry Collector
+
+Now we install the agent on your Ubuntu machine. We must use the **Contrib** version because the standard version does not include the ClickHouse exporter.
+
+**Run these commands on your Ubuntu terminal:**
+
+1.  **Download the package:**
+    ```bash
+    wget https://github.com/open-telemetry/opentelemetry-collector-releases/releases/download/v0.111.0/otelcol-contrib_0.111.0_linux_amd64.deb
+    ```
+
+2.  **Install it:**
+    ```bash
+    sudo dpkg -i otelcol-contrib_0.111.0_linux_amd64.deb
+    ```
+
+3.  **Check status (it will be active but using a default config):**
+    ```bash
+    sudo systemctl status otelcol-contrib
+    ```
+
+---
+
+### Step 4: Configure the Collector
+
+This is where we connect the dots. We will edit the configuration file to tell the Collector to scrape Postgres/Mongo and send to ClickHouse.
+
+1.  **Open the config file:**
+    ```bash
+    sudo nano /etc/otelcol-contrib/config.yaml
+    ```
+
+2.  **Delete everything currently in that file.**
+
+3.  **Paste the following configuration.**
+    *IMPORTANT: Update the `endpoint` IPs and `password` fields to match your environment.*
+
+```yaml
+# 1. RECEIVERS: Where data comes FROM
+receivers:
+  
+  # Configuration for PostgreSQL
+  postgresql:
+    endpoint: "127.0.0.1:5432" # CHANGE THIS to your Postgres IP:Port
+    transport: tcp
+    username: "otel_monitor"
+    password: "your_secure_password" # CHANGE THIS
+    databases: ["postgres"] # Add other DB names here if needed
+    collection_interval: 10s
+    tls:
+      insecure: true
+
+  # Configuration for MongoDB
+  mongodb:
+    hosts: ["127.0.0.1:27017"] # CHANGE THIS to your Mongo IP:Port
+    username: "otel_monitor"
+    password: "your_secure_password" # CHANGE THIS
+    collection_interval: 10s
+    tls:
+      insecure: true
+
+# 2. PROCESSORS: How to process data before sending
+processors:
+  # Batching is CRITICAL for ClickHouse performance
+  batch:
+    send_batch_size: 10000
+    timeout: 5s
+
+  # Adds extra metadata to every metric so you know which server it came from
+  resourcedetection:
+    detectors: [system]
+    timeout: 2s
+    override: false
+
+# 3. EXPORTERS: Where data goes TO
+exporters:
+  clickhouse:
+    endpoint: "tcp://127.0.0.1:9000" # CHANGE THIS to your ClickHouse IP and Native Port (usually 9000)
+    database: "otel"
+    ttl_days: 30
+    metrics_table_name: otlp_metrics
+    traces_table_name: otlp_traces
+    # We are not doing logs yet, but keeping the placeholder is fine
+
+# 4. SERVICE: Tying it all together into a pipeline
+service:
+  pipelines:
+    metrics:
+      receivers: [postgresql, mongodb]
+      processors: [resourcedetection, batch]
+      exporters: [clickhouse]
+    
+    # We will set up Traces later when we instrument the application code
+    # For now, this is ready to receive infrastructure traces if sent via OTLP
+    traces:
+      receivers: [] 
+      processors: [resourcedetection, batch]
+      exporters: [clickhouse]
+```
+
+4.  **Save and Exit:** (Press `Ctrl+X`, then `Y`, then `Enter`).
+
+---
+
+### Step 5: Start and Verify
+
+1.  **Restart the Collector to apply the new config:**
+    ```bash
+    sudo systemctl restart otelcol-contrib
+    ```
+
+2.  **Check the logs for errors:**
+    ```bash
+    sudo journalctl -u otelcol-contrib -f
+    ```
+    *   **Success:** You should see messages like "Everything is ready. Begin running and processing data."
+    *   **Failure:** Look for "connection refused" (wrong IP/Port) or "authentication failed" (wrong password).
+
+3.  **Verify Data in ClickHouse:**
+    Wait 10-20 seconds, then run this SQL in ClickHouse:
+    
+    ```sql
+    SELECT 
+        toDateTime(TimeUnix / 1000000000) as Time,
+        ServiceName, 
+        MetricName, 
+        Value 
+    FROM otel.otlp_metrics 
+    ORDER BY Time DESC 
+    LIMIT 20;
+    ```
+
+**Once you see rows appearing in ClickHouse, you have successfully completed Phase 1!**
+
+Let me know if you encounter any errors in the logs (Step 5.2).
+
